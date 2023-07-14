@@ -1,12 +1,14 @@
 """Downloader Class."""
 import re
-from typing import Any
+from typing import Any, List
 
+import requests
+from bs4 import BeautifulSoup as bs
 from loguru import logger
 from selectolax.lexbor import LexborHTMLParser
 
 from src.downloader.download import Downloader
-from src.utils import AppNotFound
+from src.utils import AppNotFound, slugify
 
 
 class ApkMirror(Downloader):
@@ -77,6 +79,52 @@ class ApkMirror(Downloader):
         self.extract_download_link(download_page, app)
         logger.debug(f"Downloaded {app} apk from apkmirror_specific_version")
 
+    def find_apkmirror_version_links(self, app: str) -> List[str]:
+        """Find all versions of app from apkmirror."""
+        ids = {}
+        ids.update(self.patcher.revanced_app_ids)
+        ids.update(self.patcher.revanced_extended_app_ids)
+        package_name = {i for i in ids if ids[i][0] == app}
+        s = requests.session()
+        s.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:99.0) Gecko/20100101 Firefox/99.0"
+            }
+        )
+        r = s.get(
+            f"https://www.apkmirror.com/?post_type=app_release&searchtype=apk&page=1&s={package_name}"
+        )
+        soup = bs(r.text, "html.parser")
+        app = app.replace("_", "-")
+        return list(
+            map(
+                lambda tag: tag["href"],
+                filter(
+                    lambda tag: f"{app}" in tag["href"], soup.select("a.downloadLink")
+                ),
+            )
+        )
+
+    def parse_link_version(self, link: str) -> str:
+        """Extract version from link."""
+        try:
+            link = slugify(link)
+            # re.search(r"\b\d+(?:-\d+)*\b", link).group(0)
+            searched = re.search(r"(\d+(?:-\d+)+)", link)
+            if searched:
+                return searched.group(0)
+            raise AttributeError()
+        except AttributeError:
+            logger.error("Unable to parse link to get version")
+            raise AppNotFound()
+
+    def get_latest_version(self, app: str) -> str:
+        """Get latest version of the app."""
+        version_links = self.find_apkmirror_version_links(app)
+        versions = list(map(self.parse_link_version, version_links))
+        max_version = max(versions)
+        return max_version
+
     def latest_version(self, app: str, **kwargs: Any) -> None:
         """Function to download whatever the latest version of app from
         apkmirror.
@@ -85,24 +133,6 @@ class ApkMirror(Downloader):
         :return: Version of downloaded apk
         """
         logger.debug(f"Trying to download {app}'s latest version from apkmirror")
-        page = self.config.apk_mirror_urls.get(app)
-        if not page:
-            logger.debug("Invalid app")
-            raise AppNotFound("Invalid app")
-        parser = LexborHTMLParser(self.config.session.get(page).text)
-        try:
-            main_page = parser.css_first(".appRowVariantTag>.accent_color").attributes[
-                "href"
-            ]
-        except AttributeError:
-            # Handles a case when variants are not available
-            main_page = parser.css_first(".downloadLink").attributes["href"]
-        match = re.search(r"\d", main_page)
-        if not match:
-            logger.error("Cannot find app main page")
-            raise AppNotFound()
-        main_page = f"{self.config.apk_mirror}{main_page}"
-        parser = LexborHTMLParser(self.config.session.get(main_page).text)
-        download_page = self.get_download_page(parser, main_page)
-        self.extract_download_link(download_page, app)
-        logger.debug(f"Downloaded {app} apk from apkmirror_specific_version in rt")
+        version = self.get_latest_version(app)
+        logger.debug(f"Selected {version} to download {app}'s from apkmirror")
+        return self.specific_version(app, version)
